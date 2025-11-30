@@ -1,0 +1,41 @@
+WITH orders_completed AS (
+  SELECT
+    o.order_id,
+    o.account_id,
+    o.order_date,
+    o.order_value,
+    o.product_category,
+    a.channel_type
+  FROM
+    `project-cd0b5ae6-aa02-4a42-acb.crm_dataset.order_object` AS o
+  LEFT JOIN
+    `project-cd0b5ae6-aa02-4a42-acb.crm_dataset.account_object` AS a
+  USING (account_id)
+  WHERE
+    o.order_status = 'Completed'
+),
+
+category_totals AS (
+  SELECT
+    product_category,
+    COUNT(*) AS total_orders,
+    SUM(order_value) AS total_revenue,
+    AVG(order_value) AS avg_price
+  FROM orders_completed
+  GROUP BY product_category
+),
+
+grand_total AS (
+  SELECT SUM(total_revenue) AS all_revenue FROM category_totals
+)
+
+SELECT
+  ct.product_category,
+  ct.total_revenue,
+  ct.total_orders,
+  ROUND(ct.avg_price, 2) AS avg_price,
+  ROUND(SAFE_DIVIDE(ct.total_revenue, gt.all_revenue) * 100, 2) 
+      AS pct_revenue_contribution
+FROM category_totals ct
+CROSS JOIN grand_total gt
+ORDER BY total_revenue DESC;
