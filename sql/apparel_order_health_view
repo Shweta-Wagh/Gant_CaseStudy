@@ -1,0 +1,143 @@
+WITH orders AS (
+  SELECT
+    o.order_id,
+    o.account_id,
+    DATE(o.order_date) AS order_date,
+    DATE_TRUNC(DATE(o.order_date), MONTH) AS order_month,
+    o.order_value,
+    o.product_category,
+    o.order_status
+  FROM `project-cd0b5ae6-aa02-4a42-acb.crm_dataset.order_object` o
+),
+
+accounts AS (
+  SELECT
+    account_id,
+    channel_type,
+    region,
+    DATE(create_date) AS create_date
+  FROM `project-cd0b5ae6-aa02-4a42-acb.crm_dataset.account_object`
+),
+
+-- Monthly Completed vs Cancelled
+monthly_status AS (
+  SELECT
+    order_month,
+    COUNTIF(order_status ='Completed') AS completed_orders,
+    COUNTIF(order_status ='Cancelled') AS cancelled_orders,
+    SAFE_DIVIDE(
+      COUNTIF(order_status ='Cancelled'),
+      NULLIF(COUNTIF(order_status IN ('Completed','Cancelled')),0)
+    ) AS cancel_rate
+  FROM orders
+  GROUP BY order_month
+),
+
+-- Monthly Order Patterns (incl. channel & product)
+monthly_patterns AS (
+  SELECT
+    DATE_TRUNC(order_date, MONTH) AS order_month,
+    a.channel_type,
+    o.product_category,
+    COUNT(*) AS orders_count,
+    COUNT(DISTINCT o.account_id) AS active_partners,
+    AVG(o.order_value) AS avg_order_value,
+    SAFE_DIVIDE(SUM(o.order_value),
+      NULLIF(COUNT(DISTINCT o.account_id),0)
+    ) AS avg_revenue_per_active_partner
+  FROM orders o
+  LEFT JOIN accounts a USING(account_id)
+  WHERE order_status = 'Completed'
+  GROUP BY order_month, channel_type, product_category
+),
+
+-- Seasonal Demand Index
+monthly_category AS (
+  SELECT
+    product_category,
+    DATE_TRUNC(order_date, MONTH) AS order_month,
+    COUNTIF(order_status ='Completed') AS completed_orders,
+    SUM(CASE WHEN order_status ='Completed' THEN order_value END) AS revenue
+  FROM orders
+  GROUP BY product_category, order_month
+),
+category_avg AS (
+  SELECT
+    product_category,
+    AVG(completed_orders) AS avg_orders,
+    AVG(revenue) AS avg_revenue
+  FROM monthly_category
+  GROUP BY product_category
+),
+seasonality AS (
+  SELECT
+    m.product_category,
+    m.order_month,
+    m.completed_orders,
+    m.revenue,
+    SAFE_DIVIDE(m.completed_orders, NULLIF(c.avg_orders,0)) AS orders_index,
+    SAFE_DIVIDE(m.revenue, NULLIF(c.avg_revenue,0)) AS revenue_index
+  FROM monthly_category m
+  LEFT JOIN category_avg c USING(product_category)
+),
+
+-- Partner LTV (observed + projected)
+partner_months AS (
+  SELECT
+    account_id,
+    DATE_TRUNC(order_date, MONTH) AS order_month,
+    SUM(order_value) AS revenue_in_month
+  FROM orders
+  WHERE order_status = 'Completed'
+  GROUP BY account_id, order_month
+),
+partner_ltv AS (
+  SELECT
+    account_id,
+    COUNT(*) AS active_months,
+    SUM(revenue_in_month) AS observed_ltv,
+    AVG(revenue_in_month) AS avg_monthly_rev,
+    SUM(revenue_in_month) / COUNT(*) AS monthly_avg
+  FROM partner_months
+  GROUP BY account_id
+),
+ltv_by_channel AS (
+  SELECT
+    a.channel_type,
+    COUNT(DISTINCT p.account_id) AS partner_count,
+    AVG(p.observed_ltv) AS avg_observed_ltv,
+    AVG(p.avg_monthly_rev) AS avg_monthly_revenue_per_partner,
+    AVG(p.avg_monthly_rev * p.active_months) AS avg_projected_ltv
+  FROM partner_ltv p
+  LEFT JOIN accounts a USING(account_id)
+  GROUP BY a.channel_type
+)
+
+-- FINAL SELECT combining everything
+SELECT
+  ms.order_month,
+  ms.completed_orders,
+  ms.cancelled_orders,
+  ms.cancel_rate,
+
+  mp.channel_type,
+  mp.product_category,
+  mp.orders_count,
+  mp.active_partners,
+  mp.avg_order_value,
+  mp.avg_revenue_per_active_partner,
+
+  s.orders_index,
+  s.revenue_index,
+
+  l.channel_type AS ltv_channel,
+  l.partner_count,
+  l.avg_observed_ltv,
+  l.avg_monthly_revenue_per_partner,
+  l.avg_projected_ltv
+
+FROM monthly_status ms
+LEFT JOIN monthly_patterns mp ON mp.order_month = ms.order_month
+LEFT JOIN seasonality s ON s.product_category = mp.product_category
+                       AND s.order_month = ms.order_month
+LEFT JOIN ltv_by_channel l ON l.channel_type = mp.channel_type;
